@@ -392,6 +392,11 @@ for repo in snn-research tempotron-capacity; do
     git -C "$r" -c user.name=kit -c user.email=kit@localhost commit -qm "kit snapshot of $repo@$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]]["commit"][:12])' "$SRC" "$repo")"
     touch "$r/.git/kit-snapshot"
   fi
+  # the author's remote, as recorded (it may be private: pulling needs the author's permission)
+  o=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]].get("origin",""))' "$SRC" "$repo" 2>/dev/null || true)
+  if [[ -d $r/.git && -n $o && $o != none ]] && ! git -C "$r" remote get-url origin >/dev/null 2>&1; then
+    git -C "$r" remote add origin "$o"
+  fi
 done
 
 # laboratory (the lab runner) — its history ships in the history layer; restore it next to the rest

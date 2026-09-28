@@ -23,7 +23,8 @@ Two ways in, stated honestly:
 - **Strong: also the fingerprint block from your sender** (below). Protects even if the repo
   was compromised.
 
-Neither mode's compromise breaks the other: the password never unlocks the signing key.
+Note: this kit uses one password for everything, including the maintainer's signing key, so
+only share it with people you would trust to publish the kit.
 Either way the key and snapshot date are saved under `~/.config/snn-kit/roots/`, so later runs
 verify on their own and refuse an older kit:
 
