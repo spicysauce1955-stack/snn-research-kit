@@ -14,18 +14,20 @@
 #          under it) · --no-sync (skip `uv sync`) · --claude-user (also copy the author's
 #          user-level Claude agents/skills into ~/.claude, never overwriting) · --keep-downloads ·
 #          --from DIR (install from a local copy of the kit instead of GitHub) ·
-#          --identity FILE (an already-unlocked key; testing)
+#          --password-cmd CMD (read the password from a password manager instead of the
+#          keyboard, e.g. 'pass show snn-kit' or 'op read op://vault/snn-kit/password') ·
+#          --identity FILE (an already-unlocked age key)
 set -euo pipefail
 
 KIT_REPO=${KIT_REPO:-spicysauce1955-stack/snn-research-kit}
 AGE_VERSION=v1.2.1
 AGE_SHA256=7df45a6cc87d4da11cc03a539a7470c15b1041ab2b396af088fe9990f7c79d50   # age-v1.2.1-linux-amd64.tar.gz
-ROOT=$HOME/.superset/projects LAYERS="" LAYERS_GIVEN=0 FROM="" KEYFILE="" SYNC=1 CLAUDE_USER=0 KEEP=0 LIST=0
+ROOT=$HOME/.superset/projects LAYERS="" LAYERS_GIVEN=0 FROM="" KEYFILE="" PWCMD=${KIT_PASSWORD_CMD:-} SYNC=1 CLAUDE_USER=0 KEEP=0 LIST=0
 while (($#)); do
   case $1 in
     --root) ROOT=$2; shift ;; --layers) LAYERS=$2 LAYERS_GIVEN=1; shift ;; --from) FROM=$(cd "$2" && pwd); shift ;;
-    --identity) KEYFILE=$2; shift ;; --no-sync) SYNC=0 ;; --claude-user) CLAUDE_USER=1 ;;
-    --keep-downloads) KEEP=1 ;; --list) LIST=1 ;; -h | --help) sed -n '2,19p' "$0"; exit 0 ;;
+    --identity) KEYFILE=$2; shift ;; --password-cmd) PWCMD=$2; shift ;; --no-sync) SYNC=0 ;; --claude-user) CLAUDE_USER=1 ;;
+    --keep-downloads) KEEP=1 ;; --list) LIST=1 ;; -h | --help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac; shift
 done
@@ -38,18 +40,9 @@ CACHE=$ROOT/.kit-cache; mkdir -p "$CACHE/parts"
 STATE=$ROOT/.kit-installed; touch "$STATE"
 fetch() {  # fetch NAME DEST  (from --from dir, the repo's main branch, or the `store` release)
   if [[ -n $FROM ]]; then cp "$FROM/$1" "$2"
-  elif [[ $1 == *.part* ]]; then curl -fL --retry 5 -C - -o "$2" "https://github.com/$KIT_REPO/releases/download/store/$1"
+  elif [[ $1 == *.part* ]]; then curl -fsSL --retry 5 -C - -o "$2" "https://github.com/$KIT_REPO/releases/download/store/$1"
   else curl -fsSL --retry 5 -o "$2" "https://raw.githubusercontent.com/$KIT_REPO/main/$1"; fi
 }
-
-# ---- age (pinned, checksum-verified) if the system has none
-if ! command -v age >/dev/null; then
-  [[ $(uname -sm) == "Linux x86_64" ]] || die "install age (https://age-encryption.org) and re-run"
-  say "fetching age $AGE_VERSION"
-  curl -fsSL -o "$CACHE/age.tgz" "https://github.com/FiloSottile/age/releases/download/$AGE_VERSION/age-$AGE_VERSION-linux-amd64.tar.gz"
-  echo "$AGE_SHA256  $CACHE/age.tgz" | sha256sum -c --quiet - || die "age download checksum mismatch"
-  tar -C "$CACHE" -xzf "$CACHE/age.tgz"; PATH=$CACHE/age:$PATH
-fi
 
 fetch manifest.json "$CACHE/manifest.json"
 M=$CACHE/manifest.json
@@ -93,15 +86,49 @@ python3 -c 'import json,sys
 L=[json.loads(l) for l in open(sys.argv[1])]
 print("to install:", ", ".join(x["name"] for x in L) or "-", "| download %.0f MB" % (sum(p["size"] for x in L for p in x["parts"]) / 2**20))' "$SEL" >&2
 
+# ---- age (pinned, checksum-verified) if the system has none
+if grep -q '"encrypted": true' "$SEL" && ! command -v age >/dev/null; then
+  [[ $(uname -sm) == "Linux x86_64" ]] || die "install age (https://age-encryption.org) and re-run"
+  say "fetching age $AGE_VERSION"
+  curl -fsSL -o "$CACHE/age.tgz" "https://github.com/FiloSottile/age/releases/download/$AGE_VERSION/age-$AGE_VERSION-linux-amd64.tar.gz"
+  echo "$AGE_SHA256  $CACHE/age.tgz" | sha256sum -c --quiet - || die "age download checksum mismatch"
+  tar -C "$CACHE" -xzf "$CACHE/age.tgz"; PATH=$CACHE/age:$PATH
+fi
+
 # ---- unlock the identity once (the only password prompt)
 KEYDIR=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/kit.XXXXXX"); chmod 700 "$KEYDIR"
-trap 'shred -u "$KEYDIR"/* 2>/dev/null; rm -rf "$KEYDIR"' EXIT
+trap 'if [[ -f $KEYDIR/id ]]; then shred -u "$KEYDIR/id" || rm -f "$KEYDIR/id"; fi; rm -rf "$KEYDIR"' EXIT
 if grep -q '"encrypted": true' "$SEL"; then
   if [[ -n $KEYFILE ]]; then cp "$KEYFILE" "$KEYDIR/id"
   else
     fetch identity.age "$CACHE/identity.age"
-    say "enter the kit password"
-    age -d -o "$KEYDIR/id" "$CACHE/identity.age" || die "wrong password"
+    if [[ -n $PWCMD ]]; then
+      # age reads passphrases only from a terminal: run it on a pseudo-terminal and type for it
+      KIT_PW=$(bash -c "$PWCMD") || die "--password-cmd failed"
+      KIT_PW=$KIT_PW python3 - "$KEYDIR/id" "$CACHE/identity.age" <<'EOF' || die "wrong password (from --password-cmd)"
+import os, pty, select, sys
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp("age", ["age", "-d", "-o", sys.argv[1], sys.argv[2]])
+sent, out = False, b""
+while True:
+    try:
+        r, _, _ = select.select([fd], [], [], 30)
+        if not r: break
+        chunk = os.read(fd, 1024)
+    except OSError:
+        break
+    if not chunk: break
+    out += chunk
+    if not sent and b"passphrase" in out.lower():
+        os.write(fd, os.environ["KIT_PW"].encode() + b"\n"); sent = True
+sys.exit(os.waitpid(pid, 0)[1] >> 8)
+EOF
+      unset KIT_PW
+    else
+      say "enter the kit password"
+      age -d -o "$KEYDIR/id" "$CACHE/identity.age" || die "wrong password"
+    fi
   fi
 fi
 
@@ -154,6 +181,17 @@ for repo in snn-research tempotron-capacity; do
   fi
 done
 
+# laboratory (the lab runner) — its history ships in the history layer; restore it next to the rest
+if [[ -f $ROOT/kit-history/laboratory.bundle && ! -d $ROOT/laboratory ]]; then
+  say "laboratory: cloning from the history layer"
+  git clone -q "$ROOT/kit-history/laboratory.bundle" "$ROOT/laboratory"
+  git -C "$ROOT/laboratory" remote set-url origin https://github.com/spicysauce1955-stack/laboratory.git
+fi
+
+# the author worked from a git worktree; ~300 notes and scripts cite that path. Point it here.
+WT=$HOME/.superset/worktrees/snn-research/bob/init
+if [[ ! -e $WT ]]; then mkdir -p "$(dirname "$WT")"; ln -s "$ROOT/snn-research" "$WT"; say "compat link $WT -> $ROOT/snn-research"; fi
+
 # ---- Claude Code: project memory goes where Claude Code looks for it
 CK=$ROOT/claude-kit
 if [[ -d $CK/memory ]]; then
@@ -169,7 +207,11 @@ fi
 if ((SYNC)); then
   if command -v uv >/dev/null; then
     for repo in snn-research tempotron-capacity; do say "uv sync: $repo"; (cd "$ROOT/$repo" && uv sync -q) || echo "  uv sync failed in $repo (see SETUP.md)" >&2; done
-  else echo "uv not found: install it (https://docs.astral.sh/uv/) then run 'uv sync' in both repos" >&2; fi
+  else
+    say "installing uv (https://astral.sh/uv)"
+    curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null && export PATH=$HOME/.local/bin:$PATH
+    for repo in snn-research tempotron-capacity; do say "uv sync: $repo"; (cd "$ROOT/$repo" && uv sync -q) || echo "  uv sync failed in $repo (see SETUP.md)" >&2; done
+  fi
 fi
 
 [[ $ROOT == /home/user/.superset/projects ]] || say "note: docs cite /home/user/.superset/projects/...; your tree is at $ROOT"
