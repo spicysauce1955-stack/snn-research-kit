@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # setup.sh — rebuild the snn-research workspace from the handover kit.
 #
-#   curl -fsSLO https://raw.githubusercontent.com/spicysauce1955-stack/snn-research-kit/main/setup.sh
+#   First verify this script with the commands in your handover message (curl + ssh-keygen).
+#   The first run needs the fingerprint and date from that message; they are saved in
+#   ~/.config/snn-kit/ and every later run under the same root verifies against them.
+#   bash setup.sh --fingerprint SHA256:... --not-before DATE   # first run: verify, then install
 #   bash setup.sh --list                        # what's in the kit, sizes, which parts are public
-#   bash setup.sh                               # interactive: Enter = recommended, password once
 #   bash setup.sh --check                       # PASS/FAIL health check of an installed workspace
 #   bash setup.sh --layers 'campaigns papers'   # non-interactive; `core` is always included
 #   bash setup.sh --layers 'runs/202609-*'      # add layers later; installed ones are skipped
@@ -18,18 +20,28 @@
 #          --password-cmd CMD (read the password from a password manager instead of the
 #          keyboard, e.g. 'pass show snn-kit' or 'op read op://vault/snn-kit/password') ·
 #          --identity FILE (an already-unlocked age key) · --claude (install the author's
-#          Claude Code plugins + MCP servers; needs `claude` on PATH)
+#          Claude Code plugins + MCP servers; needs `claude` on PATH) ·
+#          --fingerprint SHA256:... (or env KIT_FINGERPRINT) the signing key's fingerprint ·
+#          --not-before DATE refuse a snapshot older than DATE (rollback) · --new-fingerprint
+#          accept a fingerprint different from the saved one (the maintainer rotated the key) ·
+#          --insecure install WITHOUT verification when no fingerprint is known (not advised)
 set -euo pipefail
 
 KIT_REPO=${KIT_REPO:-spicysauce1955-stack/snn-research-kit}
 AGE_VERSION=v1.2.1
 AGE_SHA256=7df45a6cc87d4da11cc03a539a7470c15b1041ab2b396af088fe9990f7c79d50   # age-v1.2.1-linux-amd64.tar.gz
 ROOT=$HOME/.superset/projects LAYERS="" LAYERS_GIVEN=0 FROM="" KEYFILE="" PWCMD=${KIT_PASSWORD_CMD:-} SYNC=1 CLAUDE_USER=0 KEEP=0 LIST=0 CHECK=0 CLAUDE_SETUP=0
+FP="" FP_SET=0 NB="" NB_SET=0 INSECURE=0 NEWFP=0
+if [[ -n ${KIT_FINGERPRINT+set} ]]; then FP=$KIT_FINGERPRINT FP_SET=1; fi
+KIT_RAW=${KIT_RAW:-https://raw.githubusercontent.com/$KIT_REPO/main}              # mirrors/testing;
+KIT_STORE=${KIT_STORE:-https://github.com/$KIT_REPO/releases/download/store}     # trust comes from FP
 while (($#)); do
   case $1 in
     --root) ROOT=$2; shift ;; --layers) LAYERS=$2 LAYERS_GIVEN=1; shift ;; --from) FROM=$(cd "$2" && pwd); shift ;;
     --identity) KEYFILE=$2; shift ;; --password-cmd) PWCMD=$2; shift ;; --no-sync) SYNC=0 ;; --claude-user) CLAUDE_USER=1 ;;
-    --keep-downloads) KEEP=1 ;; --list) LIST=1 ;; --check) CHECK=1 ;; --claude) CLAUDE_SETUP=1 ;; -h | --help) sed -n '2,24p' "$0"; exit 0 ;;
+    --keep-downloads) KEEP=1 ;; --list) LIST=1 ;; --check) CHECK=1 ;; --claude) CLAUDE_SETUP=1 ;;
+    --fingerprint) FP=$2 FP_SET=1; shift ;; --not-before) NB=$2 NB_SET=1; shift ;;
+    --insecure) INSECURE=1 ;; --new-fingerprint) NEWFP=1 ;; -h | --help) sed -n '2,27p' "$0"; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac; shift
 done
@@ -37,7 +49,7 @@ done
 die() { echo "setup: $*" >&2; exit 1; }
 say() { printf '\033[1m==> %s\033[0m\n' "$*" >&2; }
 for c in curl tar zstd git python3 sha256sum; do command -v "$c" >/dev/null || die "please install $c"; done
-mkdir -p "$ROOT"; ROOT=$(cd "$ROOT" && pwd)
+mkdir -p "$ROOT"; ROOT=$(cd "$ROOT" && pwd -P)   # physical path: an alias must not look like a new tree
 [[ $EUID -ne 0 ]] || say "running as root: fine on a throwaway VM, but the notes assume an ordinary user (the author's was 'user')"
 
 # ---- health check: one PASS/FAIL line per claim a recipient would otherwise verify by hand
@@ -70,15 +82,116 @@ kit_check() {
   return $((fail > 0))
 }
 if ((CHECK)); then kit_check; exit $?; fi
-CACHE=$ROOT/.kit-cache; mkdir -p "$CACHE/parts"
-STATE=$ROOT/.kit-installed; touch "$STATE"
+# everything that decides trust lives OUTSIDE the tree, keyed on the physical root: no layer's
+# tar can write, replace or symlink it, and no alias of the root escapes it
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/snn-kit
+ROOT_ID=$(printf '%s' "$ROOT" | sha256sum | cut -c1-16)
+SDIR=$CONF/roots/$ROOT_ID
+SAVED=$SDIR/fingerprint INSEC_CONF=$SDIR/insecure STATE=$SDIR/installed
+INSEC_MARK=$ROOT/.kit-insecure   # in-tree copy: a hint for humans only, never trusted
+CACHE=$ROOT/.kit-cache TRUST=$ROOT/.kit-cache/trust
 fetch() {  # fetch NAME DEST  (from --from dir, the repo's main branch, or the `store` release)
   if [[ -n $FROM ]]; then cp "$FROM/$1" "$2"
-  elif [[ $1 == *.part* ]]; then curl -fsSL --retry 5 -C - -o "$2" "https://github.com/$KIT_REPO/releases/download/store/$1"
-  else curl -fsSL --retry 5 -o "$2" "https://raw.githubusercontent.com/$KIT_REPO/main/$1"; fi
+  elif [[ $1 == *.part* ]]; then curl -fsSL --retry 5 -C - -o "$2" "$KIT_STORE/$1"
+  else curl -fsSL --retry 5 -o "$2" "$KIT_RAW/$1"; fi
 }
 
+# ---- chain of trust: fingerprint (given out of band, with the password) -> signing_key.pub
+#      -> SHA256SUMS.sig -> SHA256SUMS -> manifest.json, identity.age, recipient.txt -> every part
+FP_RE='^SHA256:[A-Za-z0-9+/]{43}$' DATE_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)?$'
+NOFP="the fingerprint (SHA256:...) and date came with the password in your handover message"
+resolve_trust() {  # FP/NB from the command line, else from the first verified install; never silently off
+  ((FP_SET)) && [[ -z $FP ]] && die "empty --fingerprint (or KIT_FINGERPRINT=): $NOFP"
+  ((NB_SET)) && [[ -z $NB ]] && die "empty --not-before: $NOFP"
+  [[ -z $FP || $FP =~ $FP_RE ]] || die "--fingerprint must look like SHA256:<43 characters>, got '$FP'"
+  [[ -z $NB || $NB =~ $DATE_RE ]] || die "--not-before must look like 2026-09-28 or 2026-09-28T09:12:56Z, got '$NB'"
+  local sfp="" snb=""
+  if [[ -f $SAVED ]]; then
+    sfp=$(sed -n 's/^fingerprint=//p' "$SAVED"); snb=$(sed -n 's/^not_before=//p' "$SAVED")
+    [[ $sfp =~ $FP_RE && ( -z $snb || $snb =~ $DATE_RE ) ]] || die "$SAVED is damaged; re-run with --fingerprint and --not-before ($NOFP)"
+  fi
+  if [[ -z $FP ]]; then FP=$sfp
+  elif [[ -n $sfp && $FP != "$sfp" ]] && ! ((NEWFP)); then
+    die "fingerprint $FP differs from $sfp, saved at your first verified install ($SAVED). If your maintainer \
+sent a new one out of band (key rotation), add --new-fingerprint. Otherwise STOP."
+  fi
+  [[ -z $snb || $NB > $snb ]] || NB=$snb   # the floor only rises
+  if [[ -z $FP ]]; then
+    ((INSECURE)) || die "no fingerprint: $NOFP. Run: bash setup.sh --fingerprint SHA256:... --not-before DATE
+       (--insecure installs without any verification: whoever controls the kit repo controls what you get)"
+    say "WARNING: --insecure: kit NOT verified. Whoever controls the kit repo controls what you install."
+    # mark the tree before anything is unpacked into it (tar can add files, never remove these)
+    ((LIST)) || { mkdir -p "$SDIR"; echo "$ROOT" > "$SDIR/root"
+      echo "installed with --insecure $(date -u +%FT%TZ)" > "$INSEC_CONF"
+      rm -f "$INSEC_MARK"; echo "installed with --insecure: delete this tree to trust it" > "$INSEC_MARK"; }
+    return 0
+  fi
+  local f tainted=0
+  [[ -e $INSEC_CONF || -L $INSEC_CONF ]] && tainted=1
+  # in-tree state files are never written by a verified run (any type, dangling links included)
+  for f in .kit-insecure .kit-installed .kit-fingerprint; do [[ -e $ROOT/$f || -L $ROOT/$f ]] && tainted=1; done
+  [[ -L $CACHE ]] && tainted=1
+  if ((tainted)); then
+    die "this tree was installed unverified; delete it and reinstall with the fingerprint:
+       rm -rf '$ROOT' '$SDIR'
+       bash setup.sh --fingerprint SHA256:... --not-before DATE --root '$ROOT'   ($NOFP)
+       (anything an unverified install unpacked may be planted; a verified run cannot tell it apart)"
+  fi
+  [[ -n $sfp || -n $NB ]] || die "first verified install needs --not-before DATE as well as the fingerprint ($NOFP)"
+}
+check_date_and_save() {  # after manifest.json is verified: refuse rollback, then remember FP + the new floor
+  [[ -n $FP ]] || return 0
+  local created; created=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("created", ""))' "$1")
+  [[ $created =~ $DATE_RE ]] || die "signed manifest has no valid 'created' date"
+  [[ -z $NB || ! $created < $NB ]] || die "this snapshot ($created) is older than $NB: an old kit is being served (rollback). STOP."
+  [[ $created > $NB ]] && NB=$created
+  mkdir -p "$SDIR"; echo "$ROOT" > "$SDIR/root"
+  printf 'fingerprint=%s\nnot_before=%s\n' "$FP" "$NB" > "$SAVED.tmp" && mv "$SAVED.tmp" "$SAVED"
+  say "snapshot $created (not older than your floor); fingerprint saved in $SAVED"
+}
+self_check() {  # the running setup.sh must be the signed one; if not, install the signed one and stop
+  [[ -n $FP ]] || return 0
+  local me=${BASH_SOURCE[0]} want
+  want=$(awk '$2 == "setup.sh" { print $1 }' "$TRUST/SHA256SUMS")
+  [[ -f $me && $(sha256sum < "$me" | cut -c1-64) == "$want" ]] && return 0
+  fetch setup.sh "$TRUST/setup.sh" || die "cannot get the kit's setup.sh"
+  trusted setup.sh "$TRUST/setup.sh"
+  chmod +x "$TRUST/setup.sh"; mv -f "$TRUST/setup.sh" "$ROOT/setup.sh"   # new inode: a running copy is not disturbed
+  say "this setup.sh is not the one the kit signed (an older copy?). The signed one is now $ROOT/setup.sh."
+  echo "Re-run it with the same options: bash $ROOT/setup.sh ..." >&2
+  exit 3
+}
+trust_init() {
+  [[ -n $FP ]] || return 0
+  command -v ssh-keygen >/dev/null || die "please install ssh-keygen (openssh-client) to verify the kit"
+  rm -rf "$TRUST"; mkdir -p "$TRUST"
+  local f got
+  for f in signing_key.pub SHA256SUMS SHA256SUMS.sig; do fetch "$f" "$TRUST/$f" || die "cannot get $f: this kit is not signed. STOP."; done
+  head -1 "$TRUST/signing_key.pub" | cut -d' ' -f1,2 > "$TRUST/key.pub"   # one key, no options, no comment
+  grep -qxE 'ssh-ed25519 [A-Za-z0-9+/]+=*' "$TRUST/key.pub" || die "signing_key.pub is not a plain ssh-ed25519 key. STOP."
+  got=$(ssh-keygen -lf "$TRUST/key.pub" 2>/dev/null | cut -d' ' -f2 || true)
+  [[ $got == "$FP" ]] || die "the kit's signing key is ${got:-unreadable}, not $FP. The kit was not signed by your sender. STOP."
+  echo "snn-kit $(cat "$TRUST/key.pub")" > "$TRUST/allowed_signers"
+  ssh-keygen -Y verify -f "$TRUST/allowed_signers" -I snn-kit -n snn-kit -s "$TRUST/SHA256SUMS.sig" \
+    < "$TRUST/SHA256SUMS" >/dev/null 2>&1 || die "SHA256SUMS signature does not verify. STOP."
+  fetch recipient.txt "$TRUST/recipient.txt" || die "cannot get recipient.txt"
+  trusted recipient.txt "$TRUST/recipient.txt"
+  say "kit signature OK ($FP)"
+}
+trusted() {  # trusted NAME FILE: FILE must equal NAME's entry in the signed SHA256SUMS
+  [[ -n $FP ]] || return 0
+  local want; want=$(awk -v n="$1" '$2 == n { print $1 }' "$TRUST/SHA256SUMS")
+  [[ $want =~ ^[0-9a-f]{64}$ ]] || die "$1 is not listed (exactly once) in the signed SHA256SUMS. STOP."
+  [[ $(sha256sum "$2" | cut -c1-64) == "$want" ]] || die "$1 does not match the signed SHA256SUMS: it was changed. STOP."
+}
+resolve_trust
+mkdir -p "$CACHE/parts" "$SDIR"; touch "$STATE"   # only after the tree passed resolve_trust
+trust_init
+
 fetch manifest.json "$CACHE/manifest.json"
+trusted manifest.json "$CACHE/manifest.json"
+check_date_and_save "$CACHE/manifest.json"
+self_check
 M=$CACHE/manifest.json
 py() { python3 - "$M" "$@"; }
 
@@ -137,6 +250,7 @@ if grep -q '"encrypted": true' "$SEL"; then
   if [[ -n $KEYFILE ]]; then cp "$KEYFILE" "$KEYDIR/id"
   else
     fetch identity.age "$CACHE/identity.age"
+    trusted identity.age "$CACHE/identity.age"
     if [[ -n $PWCMD ]]; then
       # age reads passphrases only from a terminal: run it on a pseudo-terminal and type for it
       KIT_PW=$(bash -c "$PWCMD") || die "--password-cmd failed"
@@ -167,6 +281,11 @@ EOF
   fi
 fi
 
+if [[ -n $FP && -s $KEYDIR/id ]] && command -v age-keygen >/dev/null \
+  && [[ $(age-keygen -y "$KEYDIR/id" 2>/dev/null) != "$(cat "$TRUST/recipient.txt")" ]]; then
+  say "warning: this key is not the kit's (signed) recipient.txt key; decryption will fail"
+fi
+
 # ---- download, verify, decrypt, unpack
 NEW=0
 while read -r line; do
@@ -179,7 +298,7 @@ out = [L["name"], str(int(L["encrypted"] is True)), L["dest"], L["name"] + "@" +
 assert ok(r"[A-Za-z0-9/_.-]+", L["name"]) and L["dest"] in ("root", "home") and ok(r"[0-9a-f]{64}", L["content_sha256"])
 for q in L["parts"]:
     assert ok(r"[A-Za-z0-9_.-]+", q["asset"]) and ok(r"[0-9a-f]{64}", q["sha256"])
-    out.append(q["asset"] + ":" + q["sha256"])
+    out.append(q["asset"] + ":" + q["sha256"] + ":" + str(int(q["size"])))
 print("\n".join(out))
 EOF
   )
@@ -188,10 +307,12 @@ EOF
   say "$name"
   files=()
   for p in "${parts[@]}"; do
-    a=${p%%:*} sha=${p#*:} f=$CACHE/parts/${p%%:*}
+    IFS=: read -r a sha size <<<"$p"; f=$CACHE/parts/$a
     if ! echo "$sha  $f" | sha256sum -c --quiet - >/dev/null 2>&1; then
+      # a partial file resumes (curl -C -); a full-size wrong one would "resume" into the same mismatch forever
+      [[ -f $f ]] && (($(wc -c < "$f") >= size)) && rm -f "$f"
       fetch "$a" "$f"
-      echo "$sha  $f" | sha256sum -c --quiet - || die "$a: checksum mismatch (corrupt download?)"
+      echo "$sha  $f" | sha256sum -c --quiet - || { rm -f "$f"; die "$a: checksum mismatch (corrupt or substituted download)"; }
     fi
     files+=("$f")
   done
@@ -202,7 +323,7 @@ EOF
   mkdir -p "$target"
   if ((enc)); then cat "${files[@]}" | age -d -i "$KEYDIR/id" | zstd -dcq | tar -C "$target" -xf -
   else cat "${files[@]}" | zstd -dcq | tar -C "$target" -xf -; fi
-  echo "$key" >> "$STATE"; NEW=$((NEW + 1))
+  if [[ -n $FP ]]; then echo "$key"; else echo "$key@insecure"; fi >> "$STATE"; NEW=$((NEW + 1))
   ((KEEP)) || rm -f "${files[@]}"
 done < "$SEL"
 
@@ -296,12 +417,18 @@ if ((SYNC)) && { ((NEW)) || [[ ! -d $ROOT/snn-research/.venv || ! -d $ROOT/tempo
 fi
 
 [[ $ROOT == /home/user/.superset/projects ]] || say "note: docs cite /home/user/.superset/projects/...; your tree is at $ROOT"
-if [[ -f $0 && $(cd "$(dirname "$0")" && pwd)/$(basename "$0") != "$ROOT/setup.sh" ]]; then cp "$0" "$ROOT/setup.sh"
-elif [[ ! -f $ROOT/setup.sh ]]; then fetch setup.sh "$ROOT/setup.sh" || true; fi
+if [[ -f $0 && $(cd "$(dirname "$0")" && pwd -P)/$(basename "$0") != "$ROOT/setup.sh" ]]; then
+  cp "$0" "$ROOT/setup.sh.tmp.$$" && mv -f "$ROOT/setup.sh.tmp.$$" "$ROOT/setup.sh"   # never write through a link
+elif [[ ! -f $ROOT/setup.sh ]]; then
+  fetch setup.sh "$ROOT/setup.sh.new" && (trusted setup.sh "$ROOT/setup.sh.new") && mv "$ROOT/setup.sh.new" "$ROOT/setup.sh" || rm -f "$ROOT/setup.sh.new"
+fi
 kit_check || true
 cat >&2 <<EOF
 
 Done. Start with $ROOT/START-HERE.md.
-Add layers any time (bash setup.sh --layers 'runs/*'); re-check with bash setup.sh --check.
+$(if [[ -n $FP ]]; then echo "Add layers any time: bash $ROOT/setup.sh --root $ROOT --layers 'runs/*'
+  (it verifies against the fingerprint saved in $SAVED; health check: --check)."
+else echo "UNVERIFIED install (--insecure). To trust this tree, delete it and reinstall with the fingerprint:
+  rm -rf '$ROOT' '$SDIR'; bash setup.sh --fingerprint SHA256:... --not-before DATE"; fi)
 Claude Code plugins + MCP servers: bash $CK/setup-claude.sh (or re-run setup with --claude).
 EOF
