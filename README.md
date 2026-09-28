@@ -9,9 +9,37 @@ over or restoring from scratch.
 
 ## Install
 
-Your handover message carries the password, the fingerprint of the kit's signing key
-(`SHA256:...`) and a date, with these same commands. If the two copies differ, use the one in
-the message: this page is served by the repo it is meant to check.
+```bash
+curl -fsSLO https://raw.githubusercontent.com/spicysauce1955-stack/snn-research-kit/main/setup.sh
+bash setup.sh            # enter the kit password
+```
+
+Two ways in, stated honestly:
+
+- **Simple: URL + password.** Verified from the moment `setup.sh` starts (the password also
+  names the key that signed the kit, and every file is checked against that signature before
+  anything is installed), but it trusts that the GitHub repo is genuine when you first
+  download `setup.sh`: a trojaned first `setup.sh` could steal the password.
+- **Strong: also the fingerprint block from your sender** (below). Protects even if the repo
+  was compromised.
+
+Neither mode's compromise breaks the other: the password never unlocks the signing key.
+Either way the key and snapshot date are saved under `~/.config/snn-kit/roots/`, so later runs
+verify on their own and refuse an older kit:
+
+```bash
+bash ~/.superset/projects/setup.sh --list             # layers and sizes
+bash ~/.superset/projects/setup.sh --layers 'runs/*'  # add layers later
+```
+
+The simple mode's first install also has no rollback floor (you get the latest signed
+snapshot) and cannot tell a leaked *retired* signing key from the current one; the strong mode
+can. `bash setup.sh --list` without a password prints an *unverified* listing.
+
+### Stronger: if your sender gave you a fingerprint
+
+Then check `setup.sh` before running anything. The fingerprint and date came with the password;
+if the copy of these commands in your message differs from this page, use the message's.
 
 ```bash
 mkdir -p snn-kit && cd snn-kit || exit
@@ -25,24 +53,14 @@ grep '  setup\.sh$' SHA256SUMS | sha256sum -c - && echo 'KIT VERIFIED' || echo '
 bash setup.sh --fingerprint "$FP" --not-before "$NB"
 ```
 
-The block checks that the signing key is the one you were told about, that it signed
-`SHA256SUMS`, and that `setup.sh` matches it, using only `curl` and `ssh-keygen` (OpenSSH ≥ 8.1).
-`setup.sh` then checks `manifest.json`, `identity.age` and `recipient.txt` the same way, every
-download against the signed manifest, refuses a snapshot older than the date (an old kit
-served again), and replaces itself if it is not the signed `setup.sh`. It saves the fingerprint
-and date under `~/.config/snn-kit/roots/`, so later runs verify on their own:
+A new fingerprint only ever arrives the way the first one did, from your sender, out of band
+(`bash setup.sh --new-fingerprint SHA256:...`). Never believe one from this repo, this page or
+a script's output.
 
-```bash
-bash ~/.superset/projects/setup.sh --list             # layers and sizes
-bash ~/.superset/projects/setup.sh --layers 'runs/*'  # add layers later
-```
-
-Without a fingerprint, given or saved, `setup.sh` refuses (`--insecure` overrides; don't: a
-tree installed that way can only be deleted and reinstalled). A new fingerprint only ever
-arrives the way the first one did, from your sender, out of band; never believe one from this
-repo, this page or a script's output.
 Needs Linux (macOS with GNU coreutils) and `curl tar zstd git python3 ssh-keygen` (and `age`,
-fetched automatically on Linux x86-64).
+fetched automatically on Linux x86-64). `--insecure` skips all verification; don't.
 
 `manifest.json` lists the current snapshot; `manifests/` keeps every earlier one. Assets live
-in the `store` release and are content-addressed, so old snapshots stay installable.
+in the `store` release and are content-addressed; they are kept until the maintainer prunes the
+ones the current snapshot no longer uses (after a key rotation), so older snapshots may no
+longer be installable.
