@@ -3,7 +3,8 @@
 #
 #   curl -fsSLO https://raw.githubusercontent.com/spicysauce1955-stack/snn-research-kit/main/setup.sh
 #   bash setup.sh --list                        # what's in the kit, sizes, which parts are public
-#   bash setup.sh                               # interactive: pick layers, enter the password once
+#   bash setup.sh                               # interactive: Enter = recommended, password once
+#   bash setup.sh --check                       # PASS/FAIL health check of an installed workspace
 #   bash setup.sh --layers 'campaigns papers'   # non-interactive; `core` is always included
 #   bash setup.sh --layers 'runs/202609-*'      # add layers later; installed ones are skipped
 #
@@ -16,18 +17,19 @@
 #          --from DIR (install from a local copy of the kit instead of GitHub) ·
 #          --password-cmd CMD (read the password from a password manager instead of the
 #          keyboard, e.g. 'pass show snn-kit' or 'op read op://vault/snn-kit/password') ·
-#          --identity FILE (an already-unlocked age key)
+#          --identity FILE (an already-unlocked age key) · --claude (install the author's
+#          Claude Code plugins + MCP servers; needs `claude` on PATH)
 set -euo pipefail
 
 KIT_REPO=${KIT_REPO:-spicysauce1955-stack/snn-research-kit}
 AGE_VERSION=v1.2.1
 AGE_SHA256=7df45a6cc87d4da11cc03a539a7470c15b1041ab2b396af088fe9990f7c79d50   # age-v1.2.1-linux-amd64.tar.gz
-ROOT=$HOME/.superset/projects LAYERS="" LAYERS_GIVEN=0 FROM="" KEYFILE="" PWCMD=${KIT_PASSWORD_CMD:-} SYNC=1 CLAUDE_USER=0 KEEP=0 LIST=0
+ROOT=$HOME/.superset/projects LAYERS="" LAYERS_GIVEN=0 FROM="" KEYFILE="" PWCMD=${KIT_PASSWORD_CMD:-} SYNC=1 CLAUDE_USER=0 KEEP=0 LIST=0 CHECK=0 CLAUDE_SETUP=0
 while (($#)); do
   case $1 in
     --root) ROOT=$2; shift ;; --layers) LAYERS=$2 LAYERS_GIVEN=1; shift ;; --from) FROM=$(cd "$2" && pwd); shift ;;
     --identity) KEYFILE=$2; shift ;; --password-cmd) PWCMD=$2; shift ;; --no-sync) SYNC=0 ;; --claude-user) CLAUDE_USER=1 ;;
-    --keep-downloads) KEEP=1 ;; --list) LIST=1 ;; -h | --help) sed -n '2,21p' "$0"; exit 0 ;;
+    --keep-downloads) KEEP=1 ;; --list) LIST=1 ;; --check) CHECK=1 ;; --claude) CLAUDE_SETUP=1 ;; -h | --help) sed -n '2,24p' "$0"; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac; shift
 done
@@ -36,6 +38,38 @@ die() { echo "setup: $*" >&2; exit 1; }
 say() { printf '\033[1m==> %s\033[0m\n' "$*" >&2; }
 for c in curl tar zstd git python3 sha256sum; do command -v "$c" >/dev/null || die "please install $c"; done
 mkdir -p "$ROOT"; ROOT=$(cd "$ROOT" && pwd)
+[[ $EUID -ne 0 ]] || say "running as root: fine on a throwaway VM, but the notes assume an ordinary user (the author's was 'user')"
+
+# ---- health check: one PASS/FAIL line per claim a recipient would otherwise verify by hand
+kit_check() {
+  local pass=0 fail=0 r want
+  chk() { if (eval "$2") >/dev/null 2>&1; then echo "  PASS  $1"; pass=$((pass + 1)); else echo "  FAIL  $1"; fail=$((fail + 1)); fi; }
+  say "health check of $ROOT"
+  for r in snn-research tempotron-capacity; do
+    [[ -d $ROOT/$r ]] || { echo "  FAIL  $r missing (core not installed?)"; fail=$((fail + 1)); continue; }
+    want=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]]["commit"])' "$ROOT/KIT-SOURCES.json" "$r" 2>/dev/null || true)
+    if [[ -z $want ]]; then echo "  info  $r: no KIT-SOURCES.json (not a kit install) — commit not compared"
+    elif [[ -f $ROOT/$r/.git/kit-snapshot ]]; then echo "  info  $r is a snapshot commit (install the history layer for full history)"
+    else chk "$r checked out at the kit's commit ${want:0:12}" "[[ \$(git -C '$ROOT/$r' rev-parse HEAD) == $want ]]"; fi
+    chk "$r has no modified files" "[[ -z \$(git -C '$ROOT/$r' status --porcelain | grep -v '^ D ') ]]"
+    local gone; gone=$(git -C "$ROOT/$r" status --porcelain | grep -c '^ D ' || true)
+    ((gone == 0)) || echo "  info  $r: $gone tracked files belong to layers you did not install (campaigns/papers)"
+  done
+  local lc; lc=$(cd "$ROOT/snn-research" && python3 tools/claim_check.py ledger LEDGER.md 2>&1) && {
+    echo "  PASS  LEDGER.md passes claim_check ($(tail -1 <<<"$lc" | xargs))"; pass=$((pass + 1)); } || {
+    if ! grep '\[FAIL\]' <<<"$lc" | grep -qv 'evidence path does not resolve: campaigns/'; then
+      echo "  info  LEDGER.md: evidence lives in campaign layers you did not install (add 'campaigns' to verify)"
+    else echo "  FAIL  LEDGER.md claim_check:"; grep '\[FAIL\]' <<<"$lc" | head -5; fail=$((fail + 1)); fi; }
+  if command -v uv >/dev/null && [[ -d $ROOT/snn-research/.venv ]]; then
+    chk "snn-research env imports numpy<2 + brian2" "cd '$ROOT/snn-research' && uv run -q python -c 'import numpy, brian2; assert numpy.__version__ < \"2\"'"
+  fi
+  if command -v uv >/dev/null && [[ -d $ROOT/tempotron-capacity/.venv ]]; then
+    chk "lab CLI runs (tempotron-capacity)" "cd '$ROOT/tempotron-capacity' && uv run -q lab --version"
+  fi
+  echo "  $pass passed, $fail failed"
+  return $((fail > 0))
+}
+if ((CHECK)); then kit_check; exit $?; fi
 CACHE=$ROOT/.kit-cache; mkdir -p "$CACHE/parts"
 STATE=$ROOT/.kit-installed; touch "$STATE"
 fetch() {  # fetch NAME DEST  (from --from dir, the repo's main branch, or the `store` release)
@@ -63,10 +97,10 @@ table
 
 if ! ((LAYERS_GIVEN)); then
   [[ -t 0 ]] || die "no --layers given and no terminal to ask on"
-  echo; echo "core is always installed. Add more as space-separated names or globs, e.g."
-  echo "  campaigns papers history      all campaigns + papers + git history"
-  echo "  runs/202609-*                 raw runs of Sept 2026        all   everything"
-  read -rp "layers> " LAYERS
+  echo; echo "core is always installed. Press Enter for the recommended set (everything except the"
+  echo "raw runs), or type names/globs:  all · campaigns papers · history · runs/202609-* · none"
+  read -rp "layers [recommended]> " LAYERS
+  case $LAYERS in "") LAYERS="campaigns papers artifacts history lab-ledger" ;; none) LAYERS="" ;; esac
 fi
 
 SEL=$CACHE/selected.jsonl
@@ -203,6 +237,37 @@ if ((CLAUDE_USER)) && [[ -d $CK/user ]]; then
   mkdir -p "$HOME/.claude"; cp -rn "$CK/user/." "$HOME/.claude/"; say "user-level agents/skills copied (existing files kept)"
 fi
 
+# ---- orientation + a generated Claude Code setup script
+[[ -f $ROOT/snn-research/tools/backup/START-HERE.md ]] && cp "$ROOT/snn-research/tools/backup/START-HERE.md" "$ROOT/START-HERE.md"
+if [[ -f $CK/claude-setup.json ]]; then
+  python3 - "$CK/claude-setup.json" > "$CK/setup-claude.sh" <<'EOF'
+import json, shlex, sys
+c = json.load(open(sys.argv[1]))
+print("#!/usr/bin/env bash\n# generated by setup.sh from claude-setup.json: the author's plugins + MCP servers")
+print("command -v claude >/dev/null || { echo 'install Claude Code first: npm i -g @anthropic-ai/claude-code'; exit 1; }")
+for src in c.get("marketplaces", {}).values():
+    if (src or {}).get("source") == "github":
+        print(f"claude plugin marketplace add {shlex.quote(src['repo'])} || true")
+for pl in c.get("enabledPlugins", []):
+    print(f"claude plugin install {shlex.quote(pl)} || true")
+for name, m in c.get("mcpServers", {}).items():
+    if m.get("type") not in (None, "stdio"):
+        continue
+    cmd = " ".join(shlex.quote(x) for x in [m["command"], *m.get("args", [])])
+    envs = m.get("required_env", [])
+    flags = " ".join(f'-e {e}="${e}"' for e in envs)
+    line = f"claude mcp add --scope user {flags} {shlex.quote(name)} -- {cmd} || true"
+    if m["command"] not in ("npx", "node", "uvx", "python3"):
+        line = f"command -v {shlex.quote(m['command'])} >/dev/null || npm i -g {shlex.quote(m['command'])}\n" + line
+    if envs:
+        cond = " && ".join(f'[[ -n ${{{e}:-}} ]]' for e in envs)
+        line = f"if {cond}; then\n  {line}\nelse echo 'skipping MCP {name}: export {' '.join(envs)} first'; fi"
+    print(line)
+EOF
+  chmod +x "$CK/setup-claude.sh"
+  if ((CLAUDE_SETUP)); then say "Claude Code plugins + MCP servers"; bash "$CK/setup-claude.sh" || true; fi
+fi
+
 # ---- Python environments
 if ((SYNC)); then
   if command -v uv >/dev/null; then
@@ -215,9 +280,10 @@ if ((SYNC)); then
 fi
 
 [[ $ROOT == /home/user/.superset/projects ]] || say "note: docs cite /home/user/.superset/projects/...; your tree is at $ROOT"
+kit_check || true
 cat >&2 <<EOF
 
-Done. Installed layers are recorded in $STATE; re-run with --layers to add more.
-Next: read $ROOT/snn-research/tools/backup/SETUP.md (accounts, Claude Code plugins/MCP,
-credentials, first commands). The Claude setup to reproduce is in $CK/claude-setup.json.
+Done. Start with $ROOT/START-HERE.md.
+Add layers any time (bash setup.sh --layers 'runs/*'); re-check with bash setup.sh --check.
+Claude Code plugins + MCP servers: bash $CK/setup-claude.sh (or re-run setup with --claude).
 EOF
