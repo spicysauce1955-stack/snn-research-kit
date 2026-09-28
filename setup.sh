@@ -100,9 +100,10 @@ if ! ((LAYERS_GIVEN)); then
   echo; echo "core is always installed. Press Enter for the recommended set (everything except the"
   echo "raw runs), or type names/globs:  all · campaigns papers · history · runs/202609-* · none"
   read -rp "layers [recommended]> " LAYERS
-  case $LAYERS in "") LAYERS="campaigns papers artifacts history lab-ledger" ;; none) LAYERS="" ;; esac
+  [[ -n $LAYERS ]] || LAYERS="campaigns papers artifacts history lab-ledger"
 fi
 
+[[ $LAYERS != none ]] || LAYERS=""
 SEL=$CACHE/selected.jsonl
 python3 - "$M" "$STATE" "$LAYERS" > "$SEL" <<'EOF'
 import fnmatch, json, sys
@@ -167,12 +168,23 @@ EOF
 fi
 
 # ---- download, verify, decrypt, unpack
+NEW=0
 while read -r line; do
   [[ -n $line ]] || continue
-  eval "$(python3 -c 'import json,shlex,sys
-L=json.loads(sys.argv[1])
-print("name=%s enc=%d dest=%s key=%s" % (shlex.quote(L["name"]), L["encrypted"], L["dest"], shlex.quote(L["name"]+"@"+L["content_sha256"])))
-print("parts=(%s)" % " ".join(shlex.quote(p["asset"]+":"+p["sha256"]) for p in L["parts"]))' "$line")"
+  # the manifest comes from a public repo: validate every field instead of eval-ing it
+  mapfile -t F < <(python3 - "$line" <<'EOF'
+import json, re, sys
+L, ok = json.loads(sys.argv[1]), re.fullmatch
+out = [L["name"], str(int(L["encrypted"] is True)), L["dest"], L["name"] + "@" + L["content_sha256"]]
+assert ok(r"[A-Za-z0-9/_.-]+", L["name"]) and L["dest"] in ("root", "home") and ok(r"[0-9a-f]{64}", L["content_sha256"])
+for q in L["parts"]:
+    assert ok(r"[A-Za-z0-9_.-]+", q["asset"]) and ok(r"[0-9a-f]{64}", q["sha256"])
+    out.append(q["asset"] + ":" + q["sha256"])
+print("\n".join(out))
+EOF
+  )
+  ((${#F[@]} >= 5)) || die "manifest entry failed validation: ${line:0:80}"
+  name=${F[0]} enc=${F[1]} dest=${F[2]} key=${F[3]} parts=("${F[@]:4}")
   say "$name"
   files=()
   for p in "${parts[@]}"; do
@@ -190,7 +202,7 @@ print("parts=(%s)" % " ".join(shlex.quote(p["asset"]+":"+p["sha256"]) for p in L
   mkdir -p "$target"
   if ((enc)); then cat "${files[@]}" | age -d -i "$KEYDIR/id" | zstd -dcq | tar -C "$target" -xf -
   else cat "${files[@]}" | zstd -dcq | tar -C "$target" -xf -; fi
-  echo "$key" >> "$STATE"
+  echo "$key" >> "$STATE"; NEW=$((NEW + 1))
   ((KEEP)) || rm -f "${files[@]}"
 done < "$SEL"
 
@@ -233,6 +245,10 @@ if [[ -d $CK/memory ]]; then
   if [[ -e $mem ]]; then say "Claude memory exists at $mem — left alone (kit copy: $CK/memory)"
   else mkdir -p "$(dirname "$mem")"; cp -r "$CK/memory" "$mem"; say "Claude memory -> $mem"; fi
 fi
+if [[ -d $CK/user/skills/laboratory && ! -e $HOME/.claude/skills/laboratory ]]; then
+  mkdir -p "$HOME/.claude/skills"; cp -r "$CK/user/skills/laboratory" "$HOME/.claude/skills/"
+  say "laboratory skill -> ~/.claude/skills (CLAUDE.md requires it before any lab submit)"
+fi
 if ((CLAUDE_USER)) && [[ -d $CK/user ]]; then
   mkdir -p "$HOME/.claude"; cp -rn "$CK/user/." "$HOME/.claude/"; say "user-level agents/skills copied (existing files kept)"
 fi
@@ -269,7 +285,7 @@ EOF
 fi
 
 # ---- Python environments
-if ((SYNC)); then
+if ((SYNC)) && { ((NEW)) || [[ ! -d $ROOT/snn-research/.venv || ! -d $ROOT/tempotron-capacity/.venv ]]; }; then
   if command -v uv >/dev/null; then
     for repo in snn-research tempotron-capacity; do say "uv sync: $repo"; (cd "$ROOT/$repo" && uv sync -q) || echo "  uv sync failed in $repo (see SETUP.md)" >&2; done
   else
@@ -280,6 +296,8 @@ if ((SYNC)); then
 fi
 
 [[ $ROOT == /home/user/.superset/projects ]] || say "note: docs cite /home/user/.superset/projects/...; your tree is at $ROOT"
+if [[ -f $0 && $(cd "$(dirname "$0")" && pwd)/$(basename "$0") != "$ROOT/setup.sh" ]]; then cp "$0" "$ROOT/setup.sh"
+elif [[ ! -f $ROOT/setup.sh ]]; then fetch setup.sh "$ROOT/setup.sh" || true; fi
 kit_check || true
 cat >&2 <<EOF
 
